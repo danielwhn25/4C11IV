@@ -1,350 +1,267 @@
-import csv
+#!/usr/bin/python
+from tkinter import *
 import time
-from datetime import datetime
 import serial
 import serial.tools.list_ports
-from tkinter import *
-from tkinter import messagebox
+import kconvert
+import csv
+from datetime import datetime
+import os
 
-# ========= Settings =========
-DE10_BAUD = 115200
-DMM_BAUD  = 9600
+top = Tk()
+top.resizable(0, 0)
+top.title("Fluke_45/Tek_DMM4020 K-type Thermocouple")
 
-# 如果 DE10 输出 208 表示 20.8°C，就用 0.1
-# 如果你确认 DE10 输出就是 °C 整数，改成 1.0
-DE10_SCALE = 0.1
+# ATTENTION: Make sure the multimeter is configured at 9600 baud, 8-bits, parity none, 1 stop bit, echo Off
 
-CSV_PATH = "combined_temp_log.csv"
-# ============================
+CJTemp = StringVar()
+Temp = StringVar()
+DMMout = StringVar()
+portstatus = StringVar()
+DMM_Name = StringVar()
+
+connected = 0
+global ser
+
+# ---------- Recording controls ----------
+logging_enabled = False
+recording_status = StringVar()
+recording_status.set("NOT RECORDING")
+
+_last_log_epoch_int = None  # integer seconds; used to ensure 1 row/sec
+csv_path = None             # path to the active CSV file
+_record_btn = None          # will be assigned after button creation
 
 
-def list_ports():
-    """Return list of (device, description)."""
-    ports = list(serial.tools.list_ports.comports())
-    items = []
-    for p in ports:
-        # p.device like 'COM5'
-        # p.description like 'USB Serial Device (COM5)'
-        items.append((p.device, p.description))
-    return items
-
-
-def parse_de10_line(line: str):
+def safe_default_csv_path():
     """
-    Expect DE10 sends one value per line (often 3-digit integer like '208').
-    Return (raw_int, temp_c_float) or (None, None) if invalid.
+    Use a writable folder (home directory) to avoid permission issues.
     """
-    s = line.strip()
-    if not s:
-        return None, None
-
-    # keep digits only (tolerate prefixes/spaces)
-    digits = "".join(ch for ch in s if ch.isdigit())
-    if not digits:
-        return None, None
-
-    raw = int(digits)
-    temp_c = raw * DE10_SCALE
-    return raw, temp_c
+    home = os.path.expanduser("~")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"temperature_log_{stamp}.csv"
+    return os.path.join(home, filename)
 
 
-def parse_dmm_line(line: str):
+def init_csv(path):
     """
-    Parse DMM line like '+0.872E-3 VDC' or '+0.872E-3'
-    Return (vdc, mv) or (None, None).
+    Create CSV file (append mode) and write header if empty.
     """
-    s = line.strip()
-    if not s:
-        return None, None
-    s = s.replace("VDC", "").strip()
+    with open(path, "a", newline="") as f:
+        if f.tell() == 0:
+            w = csv.writer(f)
+            w.writerow(["timestamp_iso", "cj_temp_c", "dmm_vdc", "dmm_mV", "temp_c"])
+
+
+def start_recording():
+    """
+    Start logging to a new CSV file in the user's home directory.
+    """
+    global logging_enabled, csv_path, _last_log_epoch_int
+    csv_path = safe_default_csv_path()
     try:
-        v = float(s)
-        return v, v * 1000.0
+        init_csv(csv_path)
+    except Exception as e:
+        # Show error in the UI and do not enable recording
+        portstatus.set(f"CSV init error: {e}")
+        logging_enabled = False
+        recording_status.set("NOT RECORDING")
+        if _record_btn is not None:
+            _record_btn.config(text="Start Recording")
+        return
+
+    logging_enabled = True
+    _last_log_epoch_int = None  # allow immediate first write
+    recording_status.set("RECORDING")
+    portstatus.set(f"Recording to: {csv_path}")
+    if _record_btn is not None:
+        _record_btn.config(text="Stop Recording")
+
+
+def stop_recording():
+    """
+    Stop logging (no file close needed since we open per write).
+    """
+    global logging_enabled
+    logging_enabled = False
+    recording_status.set("NOT RECORDING")
+    if _record_btn is not None:
+        _record_btn.config(text="Start Recording")
+
+
+def toggle_recording():
+    if logging_enabled:
+        stop_recording()
+    else:
+        start_recording()
+
+
+def log_once_per_second(cj_temp_c, dmm_vdc, dmm_mV, temp_c):
+    """
+    Write one row per second only when recording is enabled.
+    """
+    global _last_log_epoch_int, csv_path
+
+    if not logging_enabled:
+        return
+    if csv_path is None:
+        return
+
+    now_int = int(time.time())
+    if _last_log_epoch_int == now_int:
+        return  # already logged this second
+    _last_log_epoch_int = now_int
+
+    try:
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                datetime.now().isoformat(timespec="seconds"),
+                cj_temp_c,
+                dmm_vdc,
+                dmm_mV,
+                temp_c
+            ])
+    except Exception as e:
+        # If writing fails (e.g., file locked by Excel), stop recording safely
+        portstatus.set(f"CSV write error: {e}")
+        stop_recording()
+
+
+def Just_Exit():
+    top.destroy()
+    try:
+        ser.close()
     except:
-        return None, None
+        pass
 
 
-class DualLoggerGUI:
-    def __init__(self, root: Tk):
-        self.root = root
-        self.root.title("DE10 + DMM Combined Logger")
-        self.root.resizable(0, 0)
+def update_temp():
+    global ser, connected
+    if connected == 0:
+        top.after(5000, FindPort)  # Not connected, try again in 5 seconds
+        return
 
-        # state
-        self.ser_de10 = None
-        self.ser_dmm = None
-        self.connected = False
+    try:
+        strin = ser.readline()  # Read the requested value, e.g. "+0.234E-3 VDC"
+        strin = strin.rstrip().decode()
+        print(strin)
+        ser.readline()  # Read and discard the prompt "=>"
+        if len(strin) > 1 and strin[1] == '>':  # Out of sync?
+            strin = ser.readline()
+        ser.write(b"MEAS1?\r\n")  # Request next value
+    except:
+        connected = 0
+        DMMout.set("----")
+        Temp.set("----")
+        portstatus.set("Communication Lost")
+        DMM_Name.set("--------")
+        top.after(5000, FindPort)
+        return
 
-        self.logging_enabled = False
-        self.last_logged_sec = None
+    strin_clean = strin.replace("VDC", "")  # float() doesn't like units
 
-        # latest values
-        self.de10_raw = None
-        self.de10_temp_c = None
-        self.dmm_vdc = None
-        self.dmm_mv = None
+    if len(strin_clean) > 0:
+        DMMout.set(strin.replace("\r", "").replace("\n", ""))
 
-        # UI variables
-        self.status = StringVar(value="Click 'Refresh Ports', select ports, then click 'Connect'.")
-        self.rec_status = StringVar(value="NOT RECORDING")
-        self.latest_de10 = StringVar(value="----")
-        self.latest_dmm = StringVar(value="----")
+        try:
+            dmm_vdc = float(strin_clean)       # volts
+            dmm_mV = dmm_vdc * 1000.0          # millivolts
+            valid_val = 1
+        except:
+            valid_val = 0
+            dmm_vdc = None
+            dmm_mV = None
 
-        self.de10_sel = StringVar(value="")
-        self.dmm_sel = StringVar(value="")
+        try:
+            cj = float(CJTemp.get())  # cold junction temp (C)
+        except:
+            cj = 0.0
 
-        self.port_display_list = []     # list of display strings
-        self.display_to_device = {}     # display string -> COMx
-
-        # layout
-        Label(root, textvariable=self.status, width=92, anchor="w").grid(row=0, column=0, columnspan=3, padx=8, pady=8)
-
-        Label(root, text="DE10 Port:", width=10, anchor="e").grid(row=1, column=0, padx=6, sticky="e")
-        self.de10_menu = OptionMenu(root, self.de10_sel, ())
-        self.de10_menu.config(width=65)
-        self.de10_menu.grid(row=1, column=1, columnspan=2, sticky="w", padx=6)
-
-        Label(root, text="DMM Port:", width=10, anchor="e").grid(row=2, column=0, padx=6, sticky="e")
-        self.dmm_menu = OptionMenu(root, self.dmm_sel, ())
-        self.dmm_menu.config(width=65)
-        self.dmm_menu.grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
-
-        Button(root, text="Refresh Ports", width=16, command=self.refresh_ports).grid(row=3, column=1, pady=6, sticky="w")
-        self.btn_connect = Button(root, text="Connect", width=16, command=self.connect)
-        self.btn_connect.grid(row=3, column=2, pady=6, sticky="w")
-
-        Label(root, text="DE10 latest:", width=10, anchor="e").grid(row=4, column=0, padx=6, sticky="e")
-        Label(root, textvariable=self.latest_de10, width=70, anchor="w", font=("Helvetica", 12)).grid(row=4, column=1, columnspan=2, sticky="w")
-
-        Label(root, text="DMM latest:", width=10, anchor="e").grid(row=5, column=0, padx=6, sticky="e")
-        Label(root, textvariable=self.latest_dmm, width=70, anchor="w", font=("Helvetica", 12)).grid(row=5, column=1, columnspan=2, sticky="w")
-
-        Label(root, textvariable=self.rec_status, width=20, font=("Helvetica", 12, "bold")).grid(row=6, column=0, columnspan=3, pady=8)
-
-        self.btn_record = Button(root, text="Start Recording", width=18, command=self.toggle_recording, state=DISABLED)
-        self.btn_record.grid(row=7, column=1, pady=10, sticky="w")
-
-        Button(root, text="Exit", width=18, command=self.exit).grid(row=7, column=2, pady=10, sticky="w")
-
-        # initial scan
-        self.refresh_ports()
-
-    def refresh_ports(self):
-        ports = list_ports()
-        self.port_display_list = []
-        self.display_to_device = {}
-
-        for dev, desc in ports:
-            display = f"{dev}  |  {desc}"
-            self.port_display_list.append(display)
-            self.display_to_device[display] = dev
-
-        # rebuild option menus
-        self._rebuild_option_menu(self.de10_menu, self.de10_sel, self.port_display_list)
-        self._rebuild_option_menu(self.dmm_menu, self.dmm_sel, self.port_display_list)
-
-        # pick defaults
-        if self.port_display_list:
-            if not self.de10_sel.get():
-                self.de10_sel.set(self.port_display_list[0])
-            if not self.dmm_sel.get():
-                self.dmm_sel.set(self.port_display_list[0])
-
-            self.status.set("Ports refreshed. Select DE10 and DMM ports, then click Connect.")
+        if valid_val == 1:
+            ktemp = round(kconvert.mV_to_C(dmm_mV, cj), 1)
+            if ktemp < -200:
+                Temp.set("UNDER")
+            elif ktemp > 1372:
+                Temp.set("OVER")
+            else:
+                Temp.set(ktemp)
+                # Log only if the user pressed Start Recording
+                log_once_per_second(cj, dmm_vdc, dmm_mV, ktemp)
         else:
-            self.de10_sel.set("")
-            self.dmm_sel.set("")
-            self.status.set("No serial ports detected. Plug devices in, then click Refresh Ports.")
+            Temp.set("----")
+    else:
+        Temp.set("----")
+        connected = 0
 
-    def _rebuild_option_menu(self, menu_widget, var, items):
-        menu = menu_widget["menu"]
-        menu.delete(0, "end")
-        for item in items:
-            menu.add_command(label=item, command=lambda v=item: var.set(v))
+    top.after(500, update_temp)  # ~2 measurements/sec tops
 
-    def connect(self):
-        if self.connected:
-            self.disconnect()
-            return
 
-        if not self.port_display_list:
-            messagebox.showerror("No Ports", "No serial ports detected.")
-            return
+def FindPort():
+    global ser, connected
+    try:
+        ser.close()
+    except:
+        pass
 
-        de10_display = self.de10_sel.get()
-        dmm_display = self.dmm_sel.get()
+    connected = 0
+    DMM_Name.set("--------")
 
-        de10_port = self.display_to_device.get(de10_display)
-        dmm_port = self.display_to_device.get(dmm_display)
-
-        if not de10_port or not dmm_port:
-            messagebox.showerror("Select Ports", "Please select both DE10 and DMM ports.")
-            return
-
-        if de10_port == dmm_port:
-            messagebox.showerror("Port Conflict", "DE10 and DMM cannot use the same COM port.")
-            return
-
-        # close any previous
-        self.disconnect()
-
-        # open DE10
+    portlist = list(serial.tools.list_ports.comports())
+    for item in reversed(portlist):
+        portstatus.set("Trying port " + item[0])
+        top.update()
         try:
-            self.ser_de10 = serial.Serial(de10_port, DE10_BAUD, timeout=0.2)
-        except Exception as e:
-            messagebox.showerror("DE10 Open Error", f"Failed to open {de10_port}:\n\n{e}")
-            self.ser_de10 = None
-            return
+            ser = serial.Serial(item[0], 9600, timeout=0.5)
+            ser.write(b"\x03")  # Request prompt
+            pstring = ser.readline().rstrip().decode()
 
-        # open DMM
-        try:
-            self.ser_dmm = serial.Serial(dmm_port, DMM_BAUD, timeout=0.5)
-        except Exception as e:
-            messagebox.showerror("DMM Open Error", f"Failed to open {dmm_port}:\n\n{e}")
-            try:
-                self.ser_de10.close()
-            except:
-                pass
-            self.ser_de10 = None
-            self.ser_dmm = None
-            return
-
-        # init DMM (optional; safe if your meter supports it)
-        try:
-            self.ser_dmm.write(b"\x03")
-            _ = self.ser_dmm.readline()
-            self.ser_dmm.write(b"VDC; RATE S; *IDN?\r\n")
-            _ = self.ser_dmm.readline()
-            _ = self.ser_dmm.readline()
-            self.ser_dmm.write(b"MEAS1?\r\n")
+            if len(pstring) > 1 and pstring[1] == '>':
+                ser.timeout = 3
+                portstatus.set("Connected to " + item[0])
+                ser.write(b"VDC; RATE S; *IDN?\r\n")
+                devicename = ser.readline().rstrip().decode()
+                DMM_Name.set(devicename.replace("\r", "").replace("\n", ""))
+                ser.readline()  # discard prompt
+                ser.write(b"MEAS1?\r\n")
+                connected = 1
+                top.after(1000, update_temp)
+                break
+            else:
+                ser.close()
         except:
-            pass
+            connected = 0
 
-        self.connected = True
-        self.btn_connect.config(text="Disconnect")
-        self.btn_record.config(state=NORMAL)
-        self.status.set(f"Connected: DE10={de10_port}@{DE10_BAUD}, DMM={dmm_port}@{DMM_BAUD}")
-        self.root.after(50, self.poll)
-
-    def disconnect(self):
-        # stop recording if active
-        if self.logging_enabled:
-            self.logging_enabled = False
-            self.rec_status.set("NOT RECORDING")
-            self.btn_record.config(text="Start Recording")
-
-        self.connected = False
-        self.btn_connect.config(text="Connect")
-        self.btn_record.config(state=DISABLED)
-
-        try:
-            if self.ser_de10:
-                self.ser_de10.close()
-        except:
-            pass
-        try:
-            if self.ser_dmm:
-                self.ser_dmm.close()
-        except:
-            pass
-
-        self.ser_de10 = None
-        self.ser_dmm = None
-
-    def init_csv(self):
-        with open(CSV_PATH, "a", newline="") as f:
-            if f.tell() == 0:
-                csv.writer(f).writerow([
-                    "timestamp_iso",
-                    "de10_temp_raw",
-                    "de10_temp_c",
-                    "dmm_vdc",
-                    "dmm_mV",
-                ])
-
-    def toggle_recording(self):
-        if not self.connected:
-            messagebox.showinfo("Not Connected", "Please connect to both devices first.")
-            return
-
-        self.logging_enabled = not self.logging_enabled
-        if self.logging_enabled:
-            try:
-                self.init_csv()
-            except Exception as e:
-                self.logging_enabled = False
-                messagebox.showerror("CSV Error", str(e))
-                return
-            self.last_logged_sec = None
-            self.rec_status.set("RECORDING")
-            self.btn_record.config(text="Stop Recording")
-        else:
-            self.rec_status.set("NOT RECORDING")
-            self.btn_record.config(text="Start Recording")
-
-    def poll(self):
-        if not self.connected:
-            return
-
-        # --- DE10 read ---
-        try:
-            line = self.ser_de10.readline().decode(errors="ignore").strip()
-            if line:
-                raw, tc = parse_de10_line(line)
-                if raw is not None:
-                    self.de10_raw = raw
-                    self.de10_temp_c = tc
-                    self.latest_de10.set(f"raw={raw} -> {tc:.1f} °C   (line='{line}')")
-        except Exception as e:
-            self.status.set(f"DE10 read error: {e}")
-
-        # --- DMM read ---
-        try:
-            line = self.ser_dmm.readline().decode(errors="ignore").strip()
-            if line:
-                vdc, mv = parse_dmm_line(line)
-                if vdc is not None:
-                    self.dmm_vdc = vdc
-                    self.dmm_mv = mv
-                    self.latest_dmm.set(f"{vdc:.6g} V  ({mv:.3f} mV)   (line='{line}')")
-
-            # Request next reading continuously (won't hurt if meter ignores it)
-            try:
-                self.ser_dmm.readline()  # discard prompt if any
-                self.ser_dmm.write(b"MEAS1?\r\n")
-            except:
-                pass
-        except Exception as e:
-            self.status.set(f"DMM read error: {e}")
-
-        # --- write CSV once per second ---
-        if self.logging_enabled:
-            now_sec = int(time.time())
-            if self.last_logged_sec != now_sec:
-                self.last_logged_sec = now_sec
-                try:
-                    with open(CSV_PATH, "a", newline="") as f:
-                        csv.writer(f).writerow([
-                            datetime.now().isoformat(timespec="seconds"),
-                            self.de10_raw,
-                            self.de10_temp_c,
-                            self.dmm_vdc,
-                            self.dmm_mv,
-                        ])
-                except Exception as e:
-                    messagebox.showwarning("CSV write error", str(e))
-                    self.logging_enabled = False
-                    self.rec_status.set("NOT RECORDING")
-                    self.btn_record.config(text="Start Recording")
-
-        self.root.after(50, self.poll)
-
-    def exit(self):
-        self.disconnect()
-        self.root.destroy()
+    if connected == 0:
+        portstatus.set("Multimeter not found")
+        top.after(5000, FindPort)
 
 
-if __name__ == "__main__":
-    root = Tk()
-    app = DualLoggerGUI(root)
-    root.mainloop()
+# ---------- UI ----------
+Label(top, text="Cold Junction Temperature:").grid(row=1, column=0, columnspan=2)
+Entry(top, bd=1, width=7, textvariable=CJTemp, justify="center").grid(row=2, column=0, columnspan=2)
+
+Label(top, text="Multimeter reading:").grid(row=3, column=0, columnspan=2)
+Label(top, textvariable=DMMout, width=20, font=("Helvetica", 20), fg="red").grid(row=4, column=0, columnspan=2)
+
+Label(top, text="Thermocouple Temperature (C)").grid(row=5, column=0, columnspan=2)
+Label(top, textvariable=Temp, width=5, font=("Helvetica", 100), fg="blue").grid(row=6, column=0, columnspan=2)
+
+Label(top, textvariable=portstatus, width=40, font=("Helvetica", 12)).grid(row=7, column=0, columnspan=2)
+Label(top, textvariable=DMM_Name, width=40, font=("Helvetica", 12)).grid(row=8, column=0, columnspan=2)
+
+# Recording status line
+Label(top, textvariable=recording_status, width=20, font=("Helvetica", 12, "bold")).grid(row=9, column=0, columnspan=2)
+
+# Buttons on the SAME ROW: Record (left) and Exit (right)
+_record_btn = Button(top, width=16, text="Start Recording", command=toggle_recording)
+_record_btn.grid(row=10, column=0, padx=6, pady=6)
+
+Button(top, width=16, text="Exit", command=Just_Exit).grid(row=10, column=1, padx=6, pady=6)
+
+CJTemp.set("22")
+DMMout.set("NO DATA")
+DMM_Name.set("--------")
+
+top.after(500, FindPort)
+top.mainloop()
