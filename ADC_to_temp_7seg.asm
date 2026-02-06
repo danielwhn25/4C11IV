@@ -151,7 +151,35 @@ Display_Voltage_LCD:
 	
 	ret
 
-    
+; 输出三位整数（例如 208\r\n）
+; 假设 bcd 里至少有 3 位有效数字：
+; 这里取：百位( bcd+1 高半字节 ), 十位( bcd+1 低半字节 ), 个位( bcd+0 高半字节 )
+Display_Temp3_Serial:
+    ; 百位
+    mov a, bcd+1
+    swap a
+    anl a, #0FH
+    orl a, #'0'
+    lcall putchar
+
+    ; 十位
+    mov a, bcd+1
+    anl a, #0FH
+    orl a, #'0'
+    lcall putchar
+
+    ; 个位
+    mov a, bcd+0
+    swap a
+    anl a, #0FH
+    orl a, #'0'
+    lcall putchar
+
+    mov a, #'\r'
+    lcall putchar
+    mov a, #'\n'
+    lcall putchar
+    ret    
 
 	
 Display_Voltage_Serial:
@@ -250,7 +278,7 @@ forever:
 	lcall hex2bcd
 	lcall Display_Voltage_7seg
 	lcall Display_Voltage_LCD
-	lcall Display_Voltage_Serial
+	lcall Display_Temp3_Serial
 
 
 	lcall Wait50ms
