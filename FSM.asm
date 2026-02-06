@@ -44,15 +44,69 @@ main:
     setb TR0
 
 main_loop:
+    ;For UI part d
+    ;lcall Check_Buttons     
+
     lcall Update_Seconds
     lcall Read_Temperature  
     lcall FSM_Reflow
+    
+    ;For UI part b
+    ;lcall UI_DisplayStatus
+
     mov LEDRA, fsm_state
     lcall PWM_Update
     sjmp main_loop
     
 FSM_Reflow:
     mov a, fsm_state
+
+; =====================================================
+; Check_Buttons
+; Handles START / STOP buttons
+; =====================================================
+;Check_Buttons:
+;
+;    ; ---------- STOP has priority ----------
+;    jnb STOP_BTN, STOP_PRESSED
+;    sjmp CHECK_START
+;
+;STOP_PRESSED:
+;    lcall Debounce_Delay
+;    jb STOP_BTN, CHECK_START   ; false trigger
+;
+;WAIT_STOP_RELEASE:
+;    jnb STOP_BTN, WAIT_STOP_RELEASE
+;
+;    ; FORCE safe stop
+;    mov pwm_duty,  #0
+;    mov fsm_state, #0      ; back to IDLE
+;    mov seconds,   #0
+;    ret
+;
+;CHECK_START:
+;    ; Only allow START if IDLE
+;    mov a, fsm_state
+;    cjne a, #0, DONE_CHECK
+;
+;    jnb START_BTN, START_PRESSED
+;    sjmp DONE_CHECK
+;
+;START_PRESSED:
+;    lcall Debounce_Delay
+;    jb START_BTN, DONE_CHECK
+;
+;WAIT_START_RELEASE:
+;    jnb START_BTN, WAIT_START_RELEASE
+;
+;    ; Start reflow
+;    mov seconds,   #0
+;    mov fsm_state, #1      ; PREHEAT
+;    ret
+;
+;DONE_CHECK:
+;    ret
+
 
 FSM_STATE_0: 
     cjne a, #0, FSM_STATE_1
