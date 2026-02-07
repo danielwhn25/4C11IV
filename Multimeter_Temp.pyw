@@ -38,46 +38,48 @@ def Just_Exit():
 def update_temp():
     global ser, ser2, connected
     if connected==0:
-        top.after(5000, FindPort) # Not connected, try to reconnect again in 5 seconds
+        top.after(5000, FindPort) 
         return
     try:
-        strin_bytes = ser.readline() # Read the requested value, for example "+0.234E-3 VDC"
+        strin_bytes = ser.readline() 
         strin=strin_bytes.decode()
-        ser.readline() # Read and discard the prompt "=>"
+        ser.readline() 
         if len(strin)>1:
-            if strin[1]=='>': # Out of sync?
-                strin_bytes = ser.readline() # Read the value again
+            if strin[1]=='>': 
+                strin_bytes = ser.readline() 
                 strin = strin_bytes.decode() 
-        ser.write(b"MEAS1?\r\n") # Request next value from multimeter
+        ser.write(b"MEAS1?\r\n") 
     except:
         connected=0
         DMMout.set("----")
         Temp.set("----")
         portstatus.set("Communication Lost")
         DMM_Name.set ("--------")
-        top.after(5000, FindPort) # Try to reconnect again in 5 seconds
+        top.after(5000, FindPort) 
         return
-    strin_clean = strin.replace("VDC","") # get rid of the units as the 'float()' function doesn't like it
+    strin_clean = strin.replace("VDC","") 
     if len(strin_clean) > 0:      
-       DMMout.set(strin.replace("\r", "").replace("\n", "")) # display the information received from the multimeter
+       DMMout.set(strin.replace("\r", "").replace("\n", "")) 
 
        try:
-           val=float(strin_clean)*1000.0 # Convert from volts to millivolts
+           val=float(strin_clean)*1000.0 
            valid_val=1
        except:
            valid_val=0
 
        try:
-          cj=float(CJTemp.get()) # Read the cold junction temperature in degrees centigrade
+          cj=float(CJTemp.get()) 
        except:
-          cj=0.0 # If the input is blank, assume cold junction temperature is zero degrees centigrade
+          cj=0.0 
 
-       # Initialize val2 to 0 as default
+       # Initialize val2
        val2 = 0
        
-       # Only try to read from ser2 if it exists
+       # --- MODIFIED SECTION START ---
        if ser2 is not None:
            try:
+               # REMOVED: ser2.reset_input_buffer() 
+               # We just read directly now. The timeout handles the wait.
                strin2 = ser2.readline()
                strin2 = strin2.rstrip()
                strin2 = strin2.decode()
@@ -89,6 +91,7 @@ def update_temp():
                        val2=0
            except:
                val2=0
+       # --- MODIFIED SECTION END ---
 
        if valid_val == 1 :
            ktemp=round(kconvert.mV_to_C(val, cj),1)
@@ -107,8 +110,9 @@ def update_temp():
     else:
        Temp.set("----")
        connected=0
-    top.after(500, update_temp) # The multimeter is slow and the baud rate is slow: two measurement per second tops!
+    top.after(500, update_temp)
 
+    
 def FindPort():
    global ser, connected
    try:
@@ -165,10 +169,10 @@ CJTemp.set ("22")
 DMMout.set ("NO DATA")
 DMM_Name.set ("--------")
 
-port = 'COM11' # Change to the serial port assigned to your board
+port = 'COM12' # Change to the serial port assigned to your board
 
 try:
-   ser2 = serial.Serial(port, 115200, timeout=0)
+    ser2 = serial.Serial(port, 115200, timeout=2)
 except:
    print('Serial port %s is not available' % (port))
    portlist=list(serial.tools.list_ports.comports())
