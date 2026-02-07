@@ -52,7 +52,7 @@ SendString:
 SSDone:
     ret
 
-$include(math32.asm)
+$include(math32.inc)
 
 cseg
 ; These 'equ' must match the wiring between the DE10Lite board and the LCD!
@@ -150,37 +150,6 @@ Display_Voltage_LCD:
 	lcall ?WriteData
 	
 	ret
-
-; 输出三位整数（例如 208\r\n）
-; 假设 bcd 里至少有 3 位有效数字：
-; 这里取：百位( bcd+1 高半字节 ), 十位( bcd+1 低半字节 ), 个位( bcd+0 高半字节 )
-Display_Temp3_Serial:
-    ; 百位
-    mov a, bcd+1
-    swap a
-    anl a, #0FH
-    orl a, #'0'
-    lcall putchar
-
-    ; 十位
-    mov a, bcd+1
-    anl a, #0FH
-    orl a, #'0'
-    lcall putchar
-
-    ; 个位
-    mov a, bcd+0
-    swap a
-    anl a, #0FH
-    orl a, #'0'
-    lcall putchar
-
-    mov a, #'\r'
-    lcall putchar
-    mov a, #'\n'
-    lcall putchar
-    ret    
-
 	
 Display_Voltage_Serial:
 	mov a, #'V'
@@ -266,20 +235,19 @@ forever:
 	Load_y(4096)
 	lcall div32
 	
-	;Piazza code
-	Load_y(1000)
-	lcall mul32
-	Load_y(12300)
-	lcall div32
-	Load_y(22)
-	lcall add32
-	;End of Piazza code
-	
+	Load_y(1000) ; convert to microvolts
+    lcall mul32
+    Load_y(12300) ; 41 * 300
+    lcall div32
+
+    Load_y(22) ; add cold junction temperature
+    lcall add32
+
+
 	lcall hex2bcd
 	lcall Display_Voltage_7seg
 	lcall Display_Voltage_LCD
-	lcall Display_Temp3_Serial
-
+	lcall Display_Voltage_Serial
 
 	lcall Wait50ms
 	lcall Wait50ms
