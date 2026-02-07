@@ -52,7 +52,7 @@ SendString:
 SSDone:
     ret
 
-$include(math32.inc)
+$include(math32.asm)
 
 cseg
 ; These 'equ' must match the wiring between the DE10Lite board and the LCD!
@@ -150,38 +150,73 @@ Display_Voltage_LCD:
 	lcall ?WriteData
 	
 	ret
+
+; �����λ���������� 208\r\n��
+; ���� bcd �������� 3 λ��Ч���֣�
+; ����ȡ����λ( bcd+1 �߰��ֽ� ), ʮλ( bcd+1 �Ͱ��ֽ� ), ��λ( bcd+0 �߰��ֽ� )
+Display_Temp3_Serial:
+    ; Tens Digit
+    mov a, bcd+1
+    anl a, #0FH
+    orl a, #'0'
+    lcall putchar
+
+    ; Ones Digit
+    mov a, bcd+0
+    swap a
+    anl a, #0FH
+    orl a, #'0'
+    lcall putchar
+
+    ; Decimal Point
+    mov a, #'.'
+    lcall putchar
+
+    ; Tenths Digit
+    mov a, bcd+0
+    anl a, #0FH
+    orl a, #'0'
+    lcall putchar
+
+    ; Terminator for Python's .readline()
+    mov a, #'\r'
+    lcall putchar
+    mov a, #'\n'
+    lcall putchar
+    ret
+
 	
 Display_Voltage_Serial:
-	; Send MSD (Tens of bcd+1) -> e.g., '0'
+	mov a, #'V'
+	lcall putchar
+	mov a, #'='
+	lcall putchar
+
 	mov a, bcd+1
 	swap a
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 	
-	; Send (Ones of bcd+1) -> e.g., '1'
+	mov a, #'.'
+	lcall putchar
+	
 	mov a, bcd+1
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 
-	; REMOVE THE DECIMAL POINT HERE
-	; (We want "142", not "1.42")
-
-	; Send (Tens of bcd+0) -> e.g., '4'
 	mov a, bcd+0
 	swap a
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 	
-	; Send LSD (Ones of bcd+0) -> e.g., '2'
 	mov a, bcd+0
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 
-	; Send new line
 	mov a, #'\r'
 	lcall putchar
 	mov a, #'\n'
@@ -230,34 +265,30 @@ forever:
 	mov x+0, ADC_L
 	
 	; Convert to voltage by multiplying by 5.000 and dividing by 4096
-	Load_y(5000)
+	Load_y(4103)
 	lcall mul32
 	Load_y(4096)
 	lcall div32
 	
-	Load_y(1000) ; convert to microvolts
-    lcall mul32
-    Load_y(12300) ; 41 * 300
-    lcall div32
-
-    Load_y(22) ; add cold junction temperature
-    lcall add32
-
-
+	;Piazza code
+	Load_y(1000)
+	lcall mul32
+	Load_y(12300)
+	lcall div32
+	Load_y(22)
+	lcall add32
+	;End of Piazza code
+	
 	lcall hex2bcd
 	lcall Display_Voltage_7seg
 	lcall Display_Voltage_LCD
-	lcall Display_Voltage_Serial
+	lcall Display_Temp3_Serial
 
 
-	; Limit to 1 sample per second
-    mov R7, #20
-delay_loop:
-    lcall Wait50ms
-    djnz R7, delay_loop
-    
-    ljmp forever
+	lcall Wait50ms
+	lcall Wait50ms
+	lcall Wait50ms
+	lcall Wait50ms
 	ljmp forever
 	
 end
-
