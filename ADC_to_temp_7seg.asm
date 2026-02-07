@@ -152,36 +152,36 @@ Display_Voltage_LCD:
 	ret
 	
 Display_Voltage_Serial:
-	mov a, #'V'
-	lcall putchar
-	mov a, #'='
-	lcall putchar
-
+	; Send MSD (Tens of bcd+1) -> e.g., '0'
 	mov a, bcd+1
 	swap a
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 	
-	mov a, #'.'
-	lcall putchar
-	
+	; Send (Ones of bcd+1) -> e.g., '1'
 	mov a, bcd+1
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 
+	; REMOVE THE DECIMAL POINT HERE
+	; (We want "142", not "1.42")
+
+	; Send (Tens of bcd+0) -> e.g., '4'
 	mov a, bcd+0
 	swap a
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 	
+	; Send LSD (Ones of bcd+0) -> e.g., '2'
 	mov a, bcd+0
 	anl a, #0FH
 	orl a, #'0'
 	lcall putchar
 
+	; Send new line
 	mov a, #'\r'
 	lcall putchar
 	mov a, #'\n'
@@ -249,10 +249,15 @@ forever:
 	lcall Display_Voltage_LCD
 	lcall Display_Voltage_Serial
 
-	lcall Wait50ms
-	lcall Wait50ms
-	lcall Wait50ms
-	lcall Wait50ms
+
+	; Limit to 1 sample per second
+    mov R7, #20
+delay_loop:
+    lcall Wait50ms
+    djnz R7, delay_loop
+    
+    ljmp forever
 	ljmp forever
 	
 end
+
