@@ -1,110 +1,122 @@
 import time
 import collections
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+import serial
 
-# ========= 参数 =========
-INITIAL_WINDOW = 160   # 起始窗口
-FINAL_WINDOW   = 700   # 最终窗口
-UPDATE_RATE    = 0.1   # 刷新速度（秒）→ 更快移动
-Y_MIN, Y_MAX   = 0, 300
+# ========= 参数（保留你的特征）=========
+INITIAL_WINDOW = 160     # 起始窗口：0-160
+FINAL_WINDOW   = 700     # 最终窗口：0-700，然后滚动
+UPDATE_RATE    = 0.05    # 刷新间隔（秒）— 只影响画图刷新，不影响串口读取
+Y_MIN, Y_MAX   = 0, 300  # 温度显示范围
 
-# ========= 模拟 reflow 曲线 =========
-def reflow_temp(t):
-    """
-    生成类似你图里的形状：
-    - 0~20s: 室温平稳
-    - 20~140s: S型升温到 ~160
-    - 140~200s: soak 平台 ~165-170
-    - 200~300s: 再次上升到 ~225-235
-    - 300s: 触发快速降温
-    - 300~380s: 快速下降到 ~70-90
-    - 380s后: 缓慢降到 ~60-80
-    """
-    # 让曲线更“真实”的轻微抖动（可关掉）
-    noise = 0.8 * np.sin(0.12*t) + 0.4 * np.sin(0.035*t)
+# ========= 串口设置（只改这里）=========
+PORT = "COM3"            # <<< 改成你的端口，比如 "COM5"
+BAUD = 115200
+SER_TIMEOUT = 1
 
-    # 1) 初始室温段
-    if t < 20:
-        return 25 + 0.1*t + 0.2*noise
+ser = serial.Serial(PORT, BAUD, timeout=SER_TIMEOUT)
+print(f"[OK] Serial opened: {PORT} @ {BAUD}")
 
-    # 2) S 型升温到 ~160（像真实炉子加热惯性）
-    if t < 140:
-        # logistic: 从 25 -> 165
-        # 调参：中心点、陡峭度
-        k = 0.055
-        t0 = 80
-        base = 25 + (165-25) / (1 + np.exp(-k*(t - t0)))
-        return base + noise
+# ========= 颜色映射（自然渐变）=========
+cmap = plt.get_cmap("coolwarm")
+norm = Normalize(vmin=Y_MIN, vmax=Y_MAX)
 
-    # 3) Soak 平台（轻微爬升）
-    if t < 200:
-        # 165 -> 170 缓慢上升
-        base = 165 + (170-165) * (t - 140) / (200 - 140)
-        return base + 0.6*noise
-
-    # 4) 再次升温到峰值（S型上升到 ~230）
-    if t < 300:
-        k = 0.06
-        t0 = 245
-        base = 170 + (230-170) / (1 + np.exp(-k*(t - t0)))
-        return base + 0.7*noise
-
-    # 5) 快速降温段（指数衰减，先快后慢）
-    if t < 380:
-        # 从 230 在 80 秒内掉到 ~80 左右
-        tau = 22.0  # 越小掉得越快
-        base = 80 + (230-80) * np.exp(-(t-300)/tau)
-        return base + 0.6*noise
-
-    # 6) 冷却尾巴（慢慢到 ~60）
-    tau2 = 140.0
-    base = 60 + (80-60) * np.exp(-(t-380)/tau2)
-    return base + 0.4*noise
-
-# ========= 初始化绘图 =========
+# ========= 初始化数据缓存 =========
 xs = collections.deque()
 ys = collections.deque()
 
+# 如果串口没给 sec，我们用电脑时间
+pc_t0 = time.time()
+last_draw = 0.0
+
+# ========= 初始化绘图 =========
 plt.ion()
 fig, ax = plt.subplots()
-ax.set_title("Reflow Oven Temperature")
+ax.set_title("Reflow Oven Temperature (Real Data)")
 ax.set_xlabel("Time (s)")
 ax.set_ylabel("Temperature (°C)")
 ax.set_ylim(Y_MIN, Y_MAX)
 ax.grid(True)
 
-line, = ax.plot([], [], linewidth=2)   # 单色曲线
+line_collection = LineCollection([], linewidth=2, cmap=cmap, norm=norm)
+ax.add_collection(line_collection)
 
-TIME_SCALE = 10
+info_text = ax.text(
+    0.98, 0.98, "",
+    transform=ax.transAxes,
+    ha="right", va="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.85)
+)
 
-start = time.time()
+def parse_line(s: str):
+    """
+    支持：
+    - "sec,temp"  -> (sec, temp)
+    - "temp"      -> (None, temp)
+    """
+    s = s.strip()
+    if not s:
+        return None
+    parts = s.split(",")
+    try:
+        if len(parts) == 1:
+            return (None, float(parts[0]))
+        return (float(parts[0]), float(parts[1]))
+    except ValueError:
+        return None
 
 # ========= 主循环 =========
 while True:
-    #t = time.time() - start
-    t = (time.time() - start) * TIME_SCALE
-    temp = reflow_temp(t)
+    raw = ser.readline().decode(errors="ignore")
+    parsed = parse_line(raw)
+    if parsed is None:
+        continue
+
+    sec_val, temp = parsed
+
+    # x轴：优先用 MCU 发来的 sec；否则用电脑时间
+    if sec_val is not None:
+        t = sec_val
+    else:
+        t = time.time() - pc_t0
 
     xs.append(t)
-    ys.append(temp)
+    ys.append(float(temp))
 
-    # 更新曲线
-    line.set_data(xs, ys)
+    # ====== 构造彩色线段 ======
+    if len(xs) > 1:
+        x_arr = np.asarray(xs, dtype=float)
+        y_arr = np.asarray(ys, dtype=float)
 
-    # ===== 动态横轴窗口 =====
-    # 前160秒：固定 0–160
+        points = np.column_stack((x_arr, y_arr)).reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+        line_collection.set_segments(segments)
+        line_collection.set_array(y_arr[:-1])  # 每段颜色按该段起点温度
+
+    # ====== 更新 min/max/current ======
+    t_min = float(min(ys))
+    t_max = float(max(ys))
+    info_text.set_text(
+        f"Current: {float(temp):6.1f} °C\n"
+        f"Min:     {t_min:6.1f} °C\n"
+        f"Max:     {t_max:6.1f} °C"
+    )
+
+    # ====== 横轴动态窗口（保持你之前特征）======
     if t < INITIAL_WINDOW:
         ax.set_xlim(0, INITIAL_WINDOW)
-
-    # 160 → 700 秒：窗口逐渐变宽
     elif t < FINAL_WINDOW:
         ax.set_xlim(0, t)
-
-    # >700 秒：进入滚动模式
     else:
         ax.set_xlim(t - FINAL_WINDOW, t)
 
-    fig.canvas.draw()
-    fig.canvas.flush_events()
-    time.sleep(UPDATE_RATE)
+    # 限制绘图刷新频率（防止太占CPU）
+    now = time.time()
+    if now - last_draw >= UPDATE_RATE:
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        last_draw = now
