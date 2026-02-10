@@ -6,33 +6,25 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 import serial
 
-# ========= 参数（保留你的特征）=========
-INITIAL_WINDOW = 160     # 起始窗口：0-160
-FINAL_WINDOW   = 700     # 最终窗口：0-700，然后滚动
-UPDATE_RATE    = 0.05    # 刷新间隔（秒）— 只影响画图刷新，不影响串口读取
-Y_MIN, Y_MAX   = 0, 300  # 温度显示范围
+INITIAL_WINDOW = 160
+FINAL_WINDOW   = 700
+UPDATE_RATE    = 0.05
+Y_MIN, Y_MAX   = 0, 300
 
-# ========= 串口设置（只改这里）=========
-PORT = "COM3"            # <<< 改成你的端口，比如 "COM5"
+PORT = "COM3"      # 改成你的
 BAUD = 115200
-SER_TIMEOUT = 1
-
-ser = serial.Serial(PORT, BAUD, timeout=SER_TIMEOUT)
+ser = serial.Serial(PORT, BAUD, timeout=1)
 print(f"[OK] Serial opened: {PORT} @ {BAUD}")
 
-# ========= 颜色映射（自然渐变）=========
 cmap = plt.get_cmap("coolwarm")
 norm = Normalize(vmin=Y_MIN, vmax=Y_MAX)
 
-# ========= 初始化数据缓存 =========
 xs = collections.deque()
 ys = collections.deque()
 
-# 如果串口没给 sec，我们用电脑时间
 pc_t0 = time.time()
 last_draw = 0.0
 
-# ========= 初始化绘图 =========
 plt.ion()
 fig, ax = plt.subplots()
 ax.set_title("Reflow Oven Temperature (Real Data)")
@@ -44,6 +36,7 @@ ax.grid(True)
 line_collection = LineCollection([], linewidth=2, cmap=cmap, norm=norm)
 ax.add_collection(line_collection)
 
+# 右上角信息框：Current/Min/Max（你已经有）
 info_text = ax.text(
     0.98, 0.98, "",
     transform=ax.transAxes,
@@ -51,12 +44,15 @@ info_text = ax.text(
     bbox=dict(boxstyle="round", facecolor="white", alpha=0.85)
 )
 
+# ✅ 新增：当前点（一个小圆点）+ 当前温度标签（跟着走）
+current_dot, = ax.plot([], [], marker="o", markersize=6)  # 不指定颜色，默认即可
+current_label = ax.text(
+    0, 0, "",
+    ha="left", va="bottom",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.7)
+)
+
 def parse_line(s: str):
-    """
-    支持：
-    - "sec,temp"  -> (sec, temp)
-    - "temp"      -> (None, temp)
-    """
     s = s.strip()
     if not s:
         return None
@@ -68,7 +64,6 @@ def parse_line(s: str):
     except ValueError:
         return None
 
-# ========= 主循环 =========
 while True:
     raw = ser.readline().decode(errors="ignore")
     parsed = parse_line(raw)
@@ -76,17 +71,17 @@ while True:
         continue
 
     sec_val, temp = parsed
+    temp = float(temp)
 
-    # x轴：优先用 MCU 发来的 sec；否则用电脑时间
+    # x轴：有sec用sec，没有就用电脑时间
     if sec_val is not None:
-        t = sec_val
+        t = float(sec_val)
     else:
         t = time.time() - pc_t0
 
     xs.append(t)
-    ys.append(float(temp))
+    ys.append(temp)
 
-    # ====== 构造彩色线段 ======
     if len(xs) > 1:
         x_arr = np.asarray(xs, dtype=float)
         y_arr = np.asarray(ys, dtype=float)
@@ -95,18 +90,23 @@ while True:
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
         line_collection.set_segments(segments)
-        line_collection.set_array(y_arr[:-1])  # 每段颜色按该段起点温度
+        line_collection.set_array(y_arr[:-1])
 
-    # ====== 更新 min/max/current ======
+    # min/max/current
     t_min = float(min(ys))
     t_max = float(max(ys))
     info_text.set_text(
-        f"Current: {float(temp):6.1f} °C\n"
+        f"Current: {temp:6.1f} °C\n"
         f"Min:     {t_min:6.1f} °C\n"
         f"Max:     {t_max:6.1f} °C"
     )
 
-    # ====== 横轴动态窗口（保持你之前特征）======
+    # ✅ 更新“当前点 + 当前温度标签”
+    current_dot.set_data([t], [temp])
+    current_label.set_position((t, temp))
+    current_label.set_text(f"{temp:.1f}°C")
+
+    # 横轴窗口
     if t < INITIAL_WINDOW:
         ax.set_xlim(0, INITIAL_WINDOW)
     elif t < FINAL_WINDOW:
@@ -114,7 +114,7 @@ while True:
     else:
         ax.set_xlim(t - FINAL_WINDOW, t)
 
-    # 限制绘图刷新频率（防止太占CPU）
+    # 限制刷新频率
     now = time.time()
     if now - last_draw >= UPDATE_RATE:
         fig.canvas.draw()
