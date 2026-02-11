@@ -1934,10 +1934,10 @@ M_FSM_3_REACHED:
     ret
 
 
-; REFLOW: 20% for time_reflow seconds
+; REFLOW: 25% for time_reflow seconds
 M_FSM_4:
     cjne a, #4, M_FSM_5
-    mov pwm_duty, #20
+    mov pwm_duty, #25
 
     mov a, seconds
     clr c
