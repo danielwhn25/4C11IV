@@ -1,13 +1,9 @@
 import random
 import numpy as np
 
-# ============================================================
-# DELTA LIMITER CONFIGURATION (edit these)
-# ============================================================
-
 ENABLE_DELTA_LIMITER = True
-DELTA_LIMIT_C = 1.8       # degrees C
-DELTA_STEP_C = 0.1        # discrete step for randomized limiter (0.1, 0.2, ...)
+DELTA_LIMIT_C = 1.8
+DELTA_STEP_C = 0.1
 
 def apply_delta_limiter(ktemp: float, opamp_temp: float) -> float:
     if not ENABLE_DELTA_LIMITER:
