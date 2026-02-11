@@ -65,7 +65,7 @@ STOP_BTN    equ P3.5
 ; SSR / MOSFET gate output
 ; -------------------------
 HEATER_OUT  equ P1.3
-
+SPEAKER     equ P1.2
 ; -----------------------------------------------------
 ; Timer0 timebase
 ; 5 ms tick @ 33.333 MHz, Timer0 ticks at FREQ/12
@@ -178,7 +178,7 @@ main:
     ; P3.x buttons input
     ; -------------------------
     mov P0MOD, #10101010b
-    mov P1MOD, #10001010b      ; b7=1 (RS), b3=1 (HEATER), b1=1 (E)
+    mov P1MOD, #10001110b      ; b7=1 (RS), b3=1 (HEATER), b1=1 (E)
     mov P3MOD, #00000000b
 
     ; pull-up style inputs
@@ -892,6 +892,8 @@ SAB_ABORT:
     mov timer_tick, #0
     mov startup_sec, #0
     setb force_redraw
+    mov R3, #10
+    lcall Beep_N_Times
     ret
 
 ; =====================================================
@@ -1024,131 +1026,90 @@ M_PWM_ON:
 FSM_Reflow_TempBased:
     mov a, fsm_state
 
-M_FSM_0:
-    cjne a, #0, M_FSM_1
+FSM_STATE_0: 
+    cjne a, #0, FSM_STATE_1
     mov pwm_duty, #0
     ret
 
-; PREHEAT: full power until within 20C of temp_soak, then 20% until reaching temp_soak
-M_FSM_1:
-    cjne a, #1, M_FSM_2
-
-    ; If T >= temp_soak -> next state
-    mov a, temp_current
-    clr c
-    subb a, temp_soak
-    jnc M_FSM_1_REACHED
-
-    ; threshold = max(temp_soak - 20, 0)
+FSM_STATE_1: 
+    cjne a, #1, FSM_STATE_2
+    mov pwm_duty, #100
     mov a, temp_soak
     clr c
-    subb a, #20
-    jnc M_FSM_1_TOK
-    mov a, #0
-M_FSM_1_TOK:
-    mov R7, a
-
-    ; If T >= threshold -> 20%, else 100%
-    mov a, temp_current
-    clr c
-    subb a, R7
-    jnc M_FSM_1_NEAR
-
-    mov pwm_duty, #100
-    ret
-
-M_FSM_1_NEAR:
-    mov pwm_duty, #20
-    ret
-
-M_FSM_1_REACHED:
+    subb a, temp_current
+    jnc preheat_done       
     mov seconds,   #0
     mov fsm_state, #2
+    mov R3, #1           
+    lcall Beep_N_Times
     setb force_redraw
+preheat_done:
     ret
 
-
-; SOAK: 20% for time_soak seconds
-M_FSM_2:
-    cjne a, #2, M_FSM_3
+FSM_STATE_2: 
+    cjne a, #2, FSM_STATE_3
     mov pwm_duty, #20
-
     mov a, seconds
     clr c
     subb a, time_soak
-    jc  M_FSM_2_DONE
-
+    jc soak_done           
     mov seconds,   #0
     mov fsm_state, #3
+    mov R3, #1           
+    lcall Beep_N_Times
     setb force_redraw
-M_FSM_2_DONE:
+soak_done:
     ret
 
-; RAMP: full power until within 5C of temp_reflow, then 25% until reaching temp_reflow
-M_FSM_3:
-    cjne a, #3, M_FSM_4
-
-    ; If T >= temp_reflow -> next state
-    mov a, temp_current
-    clr c
-    subb a, temp_reflow
-    jnc M_FSM_3_REACHED
-
-    ; threshold = max(temp_reflow - 5, 0)
+FSM_STATE_3: 
+    cjne a, #3, FSM_STATE_4
+    mov pwm_duty, #100
     mov a, temp_reflow
     clr c
-    subb a, #5
-    jnc M_FSM_3_TOK
-    mov a, #0
-M_FSM_3_TOK:
-    mov R7, a
-
-    ; If T >= threshold -> 25%, else 100%
-    mov a, temp_current
-    clr c
-    subb a, R7
-    jnc M_FSM_3_NEAR
-
-    mov pwm_duty, #100
-    ret
-
-M_FSM_3_NEAR:
-    mov pwm_duty, #25
-    ret
-
-M_FSM_3_REACHED:
+    subb a, temp_current
+    jnc ramp_done         
     mov seconds,   #0
     mov fsm_state, #4
+    mov R3, #1           
+    lcall Beep_N_Times
     setb force_redraw
+ramp_done:
     ret
 
-
-; REFLOW: 20% for time_reflow seconds
-M_FSM_4:
-    cjne a, #4, M_FSM_5
+FSM_STATE_4: 
+    cjne a, #4, FSM_STATE_5
     mov pwm_duty, #20
-
     mov a, seconds
     clr c
     subb a, time_reflow
-    jc  M_FSM_4_DONE
-
-    mov seconds,   #0
+    jc reflow_done        
+    mov pwm_duty, #0
     mov fsm_state, #5
-    mov pwm_duty,  #0
+    mov R3, #1           
+    lcall Beep_N_Times
     setb force_redraw
-M_FSM_4_DONE:
+reflow_done:
     ret
 
-; COOL: 0% indefinitely (until user aborts)
-M_FSM_5:
+FSM_STATE_5: 
     cjne a, #5, M_FSM_DONE
     mov pwm_duty, #0
-M_FSM_5_DONE:
+    mov a, temp_current
+    clr c
+    subb a, #60
+    jnc cooling_done       
+    mov fsm_state, #0 
+    mov R3, #5  
+    lcall Beep_N_Times
+    setb force_redraw
+    
+cooling_done:
     ret
 
 M_FSM_DONE:
     ret
+
+; COOL: 0% indefinitely (until user aborts)
 
 ; =====================================================
 ; Local strings (unique names)
@@ -1196,4 +1157,36 @@ SegTable:
     db 080h ;8
     db 090h ;9
 
+Beep_N_Times:
+    mov a, R3
+    jz beep_exit
+beep_loop:
+    push AR0
+    push AR1
+    push AR2
+    mov R2, #100
+beep_tone:
+    cpl SPEAKER
+    mov R1, #100
+beep_delay:
+    nop
+    nop
+    djnz R1, beep_delay
+    djnz R2, beep_tone
+    pop AR2
+    pop AR1
+    pop AR0
+    lcall Wait_Beep_Gap
+    djnz R3, beep_loop
+beep_exit:
+    ret
+
+Wait_Beep_Gap:
+    mov R2, #200
+wb_loop:
+    mov R1, #200
+    djnz R1, $
+    djnz R2, wb_loop
+    ret
 END
+
