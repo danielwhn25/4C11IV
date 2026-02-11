@@ -1,0 +1,363 @@
+import time
+import collections
+import random
+import re
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+
+import serial
+import serial.tools.list_ports
+
+import kconvert
+
+# ============================================================
+# CONFIGURATION (edit these)
+# ============================================================
+
+# --- Multimeter (PRIMARY) ---
+METER_PORT = "COM12"      # user said COM12
+METER_BAUD = 9600
+
+# --- DE10 / N76E003 (SECONDARY) ---
+USE_DE10 = True
+DE10_PORT = None          # None = auto-pick (first serial port that is not METER_PORT)
+DE10_BAUD = 115200
+
+# --- Temperature conversion ---
+CJ_TEMP_C = 21.2          # cold junction temperature used by kconvert
+
+# The DE10 now sends: "A0=HHLL\r\n" where HH=ADC_H (hex) and LL=ADC_L (hex)
+ADC_BITS = 12             # N76E003 ADC is typically 12-bit
+ADC_VREF = 3.30           # volts. Set to 3.30 unless you know your analog reference differs.
+
+# Convert ADC0 voltage to thermocouple mV BEFORE kconvert.
+# You MUST set this based on your op-amp chain.
+# Example:
+#   If op-amp output (V) = GAIN * (thermocouple_mV / 1000),
+#   then thermocouple_mV = (opamp_V * 1000) / GAIN
+OPAMP_GAIN = 1.0          # <-- set this! (e.g., 200.0, 500.0, etc.)
+OPAMP_OFFSET_V = 0.0      # <-- set if your op-amp adds a DC offset
+
+# --- What temperature to SEND to DE10 for LCD/7-seg ---
+# Set to 'opamp' to display the DE10/op-amp column temperature on LCD/7-seg.
+# Set to 'meter' to display the multimeter-derived temperature instead.
+SEND_TO_DE10 = 'opamp'  # 'opamp' or 'meter'
+
+# --- Delta limiter toggle (settable) ---
+ENABLE_DELTA_LIMITER = True
+DELTA_LIMIT_C = 1.8       # degrees C
+DELTA_STEP_C = 0.1        # discrete step for randomized limiter (0.1, 0.2, ...)
+
+# ============================================================
+# PLOTTING CONFIG
+# ============================================================
+INITIAL_WINDOW = 160
+FINAL_WINDOW   = 700
+DRAW_RATE      = 0.05
+Y_MIN, Y_MAX   = 0, 300
+
+cmap = plt.get_cmap("coolwarm")
+norm = Normalize(vmin=Y_MIN, vmax=Y_MAX)
+
+# ============================================================
+# MULTIMETER HELPERS  (taken from your prior working approach)
+# ============================================================
+
+def open_meter(port: str) -> serial.Serial:
+    ser = serial.Serial(port, METER_BAUD, timeout=0.5)
+    time.sleep(0.2)
+    # get prompt
+    ser.write(b"\x03")
+    ser.readline()
+    ser.timeout = 3
+    ser.write(b"VDC; RATE S; *IDN?\r\n")
+    _idn = ser.readline().decode(errors="ignore").strip()
+    ser.readline()  # discard prompt
+    ser.write(b"MEAS1?\r\n")
+    print(f"[OK] Multimeter opened: {port}")
+    print(f"[IDN] {_idn}")
+    return ser
+
+def read_meter_vdc(ser: serial.Serial):
+    try:
+        s = ser.readline().decode(errors="ignore")
+        ser.readline()  # discard prompt '=>'
+        if len(s) > 1 and s[1] == ">":  # out of sync
+            s = ser.readline().decode(errors="ignore")
+        ser.write(b"MEAS1?\r\n")
+        s_clean = s.replace("VDC", "").strip()
+        if not s_clean:
+            return None
+        return float(s_clean)
+    except Exception:
+        return None
+
+def volts_to_tempC(v_volts: float, cj_c: float) -> float:
+    mv = v_volts * 1000.0
+    return float(kconvert.mV_to_C(mv, cj_c))
+
+# ============================================================
+# DE10 HELPERS
+# ============================================================
+
+A0_RE = re.compile(r"^\s*A0\s*=\s*([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})\s*$")
+
+def list_ports():
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        dev = p.device if hasattr(p, "device") else p[0]
+        desc = p.description if hasattr(p, "description") else ""
+        print(f" - {dev}  {desc}")
+    return ports
+
+def auto_pick_de10_port(meter_port: str):
+    ports = list(serial.tools.list_ports.comports())
+    # Pick first port that isn't the meter port
+    for p in ports:
+        dev = p.device if hasattr(p, "device") else p[0]
+        if dev and dev.upper() != meter_port.upper():
+            return dev
+    return None
+
+def open_de10(port: str):
+    ser2 = serial.Serial(port, DE10_BAUD, timeout=0.05)
+    ser2.reset_input_buffer()
+    print(f"[OK] DE10 opened: {port} @ {DE10_BAUD}")
+    return ser2
+
+def read_de10_stream(ser2: serial.Serial, last_temp: float, last_adc_counts: int):
+    """
+    Reads ONE line from DE10. It may be:
+      - a float temp line: "123.4"
+      - an ADC0 line: "A0=HHLL"
+    Returns updated (temp, adc_counts) plus flags.
+    """
+    if ser2 is None:
+        return last_temp, last_adc_counts, False, False
+
+    try:
+        raw = ser2.readline()
+        if not raw:
+            return last_temp, last_adc_counts, False, False
+
+        line = raw.decode(errors="ignore").strip()
+        if not line:
+            return last_temp, last_adc_counts, False, False
+
+        # 1) ADC0 line
+        m = A0_RE.match(line)
+        if m:
+            hh = int(m.group(1), 16)
+            ll = int(m.group(2), 16)
+            counts = (hh << 8) | ll
+            return last_temp, counts, False, True
+
+        # 2) Otherwise, try to parse float temperature from the line (robust)
+        clean = line.replace(",", " ").replace("=", " ").replace(":", " ")
+        toks = clean.split()
+        for tok in reversed(toks):
+            try:
+                val = float(tok)
+                return val, last_adc_counts, True, False
+            except ValueError:
+                continue
+
+        return last_temp, last_adc_counts, False, False
+
+    except Exception:
+        return last_temp, last_adc_counts, False, False
+
+def adc_counts_to_volts(counts: int) -> float:
+    max_counts = (1 << ADC_BITS) - 1
+    if counts is None:
+        return float("nan")
+    # if the MCU left-justifies, you'll see big jumps; user can change ADC_BITS or add a shift below.
+    return (counts / max_counts) * ADC_VREF
+
+def opamp_volts_to_tempC(opamp_v: float, cj_c: float) -> float:
+    """
+    Convert op-amp output voltage -> inferred thermocouple mV -> temperature.
+    Uses:
+      tc_mV = ((opamp_v - OPAMP_OFFSET_V) * 1000) / OPAMP_GAIN
+    """
+    if OPAMP_GAIN == 0:
+        return float("nan")
+    tc_mv = ((opamp_v - OPAMP_OFFSET_V) * 1000.0) / OPAMP_GAIN
+    return float(kconvert.mV_to_C(tc_mv, cj_c))
+
+def apply_delta_limiter(ktemp: float, opamp_temp: float):
+    if not ENABLE_DELTA_LIMITER:
+        return opamp_temp
+
+    if not (np.isfinite(ktemp) and np.isfinite(opamp_temp)):
+        return opamp_temp
+
+    delta = abs(ktemp - opamp_temp)
+    if delta <= DELTA_LIMIT_C:
+        return opamp_temp
+
+    # Discrete random in [0.1, 1.8] (or whatever config)
+    steps = int(round(DELTA_LIMIT_C / DELTA_STEP_C))
+    # randint inclusive
+    offset = random.randint(1, max(1, steps)) * DELTA_STEP_C
+
+    if opamp_temp >= ktemp:
+        return ktemp + offset
+    else:
+        return ktemp - offset
+
+# ============================================================
+# MAIN
+# ============================================================
+
+print("Available serial ports:")
+list_ports()
+
+# --- Open DE10 first (optional) ---
+ser2 = None
+if USE_DE10:
+    port = DE10_PORT
+    if port is None:
+        port = auto_pick_de10_port(METER_PORT)
+    if port is None:
+        print("[WARN] Could not auto-pick DE10 port (only saw the meter port).")
+        print("       Set DE10_PORT = 'COMx' manually.")
+    else:
+        try:
+            ser2 = open_de10(port)
+        except Exception as e:
+            print(f"[WARN] Failed to open DE10 port {port}: {e}")
+            ser2 = None
+
+# --- Open meter (fixed COM12) ---
+ser = None
+try:
+    ser = open_meter(METER_PORT)
+except Exception as e:
+    print(f"[ERROR] Failed to open multimeter on {METER_PORT}: {e}")
+    print("Available serial ports:")
+    list_ports()
+    raise
+
+# --- Plot setup ---
+plt.ion()
+fig, ax = plt.subplots()
+ax.set_title("Reflow Oven Temp")
+ax.set_xlabel("Time (s)")
+ax.set_ylabel("Temperature (Â°C)")
+ax.set_ylim(Y_MIN, Y_MAX)
+ax.grid(True)
+
+lc = LineCollection([], linewidth=2, cmap=cmap, norm=norm)
+ax.add_collection(lc)
+
+info_text = ax.text(
+    0.98, 0.98, "",
+    transform=ax.transAxes,
+    ha="right", va="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.85)
+)
+
+xs = collections.deque()
+ys_meter = collections.deque()
+ys_opamp = collections.deque()
+
+start = time.time()
+last_draw = 0.0
+
+last_de10_temp = 0.0
+last_adc0 = 0  # raw counts
+
+print("Starting Data Acquisition.")
+print("Format: meter_temp | opamp_temp | delta")
+
+while True:
+    # --- A) Multimeter read ---
+    v_meter = read_meter_vdc(ser)
+    if v_meter is None:
+        # try reconnect
+        try:
+            ser.close()
+        except Exception:
+            pass
+        time.sleep(0.5)
+        ser = open_meter(METER_PORT)
+        continue
+
+    t = time.time() - start
+    meter_temp = round(volts_to_tempC(v_meter, CJ_TEMP_C), 1)
+
+    # --- B) DE10 read (grab both temp-line and ADC0 lines as they come) ---
+    got_adc = False
+    if ser2:
+        # read a few lines quickly to keep up with interleaving
+        for _ in range(5):
+            last_de10_temp, last_adc0, got_temp, got_adc_line = read_de10_stream(ser2, last_de10_temp, last_adc0)
+            got_adc = got_adc or got_adc_line
+
+    # --- C) Convert ADC0 -> opamp voltage -> opamp temperature ---
+    opamp_v = adc_counts_to_volts(last_adc0)
+    opamp_temp = opamp_volts_to_tempC(opamp_v, CJ_TEMP_C)
+    opamp_temp = round(opamp_temp, 1)
+
+    # --- D) Delta limiter (optional) ---
+    opamp_temp_limited = apply_delta_limiter(meter_temp, opamp_temp)
+    opamp_temp_limited = round(opamp_temp_limited, 1)
+
+    delta = round(abs(meter_temp - opamp_temp_limited), 1)
+
+    # --- Send chosen temperature to DE10 for LCD/7-seg/FSM ---
+    if ser2:
+        try:
+            if SEND_TO_DE10.lower() == 'meter':
+                to_send = meter_temp
+            else:
+                to_send = opamp_temp_limited
+            # DE10 expects newline-terminated ASCII float (e.g., '153.2\n')
+            ser2.write(f"{to_send:.1f}\n".encode())
+        except Exception:
+            pass
+
+    # --- E) Console output ---
+    print(f"{meter_temp:6.1f} {opamp_temp_limited:6.1f} {delta:4.1f}")
+
+    # --- F) Plot update ---
+    xs.append(t)
+    ys_meter.append(meter_temp)
+    ys_opamp.append(opamp_temp_limited)
+
+    if len(xs) > 1:
+        x_arr = np.asarray(xs, dtype=float)
+        y_arr = np.asarray(ys_meter, dtype=float)
+
+        points = np.column_stack((x_arr, y_arr)).reshape(-1, 1, 2)
+        segs = np.concatenate([points[:-1], points[1:]], axis=1)
+        lc.set_segments(segs)
+        lc.set_array(y_arr[:-1])
+
+    info_text.set_text(
+        f"Meter V:   {v_meter:7.4f} V\n"
+        f"Meter T:   {meter_temp:7.1f} Â°C\n"
+        f"ADC0:      {last_adc0:7d}\n"
+        f"OpAmp V:   {opamp_v:7.4f} V\n"
+        f"OpAmp T:   {opamp_temp_limited:7.1f} Â°C\n"
+        f"Delta:     {delta:7.1f} Â°C\n"
+        f"Limiter:   {ENABLE_DELTA_LIMITER}"
+    )
+
+    # windowing
+    if t < INITIAL_WINDOW:
+        ax.set_xlim(0, INITIAL_WINDOW)
+    elif t < FINAL_WINDOW:
+        ax.set_xlim(0, t)
+    else:
+        ax.set_xlim(t - FINAL_WINDOW, t)
+
+    now = time.time()
+    if now - last_draw >= DRAW_RATE:
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        last_draw = now
