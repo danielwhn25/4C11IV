@@ -8,3 +8,5 @@ How to navigate this repo:
 
 - Special features: NEC communication protocol remote control to modify reflow parameters
 - I2C laser receiver module to detect oven door open/close states
+- 
+<img width="1939" height="1060" alt="ELEC291_PROJ1_BLOCK_DIAGRAM" src="https://github.com/user-attachments/assets/2d26c017-941c-42da-bf68-a4a4bddfe191" />
